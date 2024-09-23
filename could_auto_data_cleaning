@@ -1,0 +1,207 @@
+import pandas as pd
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+from auto_smooth import auto_savgol  # Assuming this is a valid import
+
+# Assuming motion_correction class is defined above or imported from another module
+class motion_correction:
+    def __init__(self, threshold):
+        self.threshold = threshold
+    
+    def remove_spikes(self, voltages):
+        # Convert voltages to DataFrame if it is not already one
+        if isinstance(voltages, np.ndarray):
+            voltages = pd.DataFrame(voltages)
+        
+        # Calculate mean and standard deviation
+        dec_mean = voltages.mean()
+        dec_std = voltages.std()
+
+        # Calculate z-score
+        z_score = np.abs((voltages - dec_mean) / dec_std)
+
+        # Interpolate spikes
+        dec_data_despiked = voltages.copy()
+        spike_indices = z_score >= self.threshold  # Boolean array for spikes
+        dec_data_despiked[spike_indices] = np.nan  # Set spikes to NaN
+
+        # Interpolate NaN values
+        dec_data_despiked = dec_data_despiked.interpolate(method='linear', limit_direction='both')
+        dec_data_despiked.fillna(method='bfill', inplace=True)
+        dec_data_despiked.fillna(method='ffill', inplace=True)
+
+        return dec_data_despiked
+
+    def apply(self, voltages):
+        return self.remove_spikes(voltages)
+
+class digi_analog_conv:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        print(f"Initialized with file path: {file_path}")
+        self.motion_corrector = motion_correction(threshold=3)  # Initialize motion correction with a threshold
+    
+    def formula(self):
+        data_pattern = r'L'
+        print(f"Processing file: {self.file_path}")
+
+        with open(self.file_path, 'r', encoding='latin-1') as f:
+            file_lines = f.readlines()
+            
+            rows_to_append = []
+            for line in file_lines:
+                line = line.strip()
+                if re.match(data_pattern, line):  
+                    columns = line.split(',')
+                    date = columns[1]
+                    time = columns[3]
+                    extracted_columns = columns[5:31]  # Extract relevant hexadecimal data columns
+                    
+                    dec_data = []
+                    for x in extracted_columns:
+                        try:
+                            dec_data.append(int(x, 16))  # Convert hexadecimal to decimal
+                        except ValueError:
+                            print(f"Skipping non-hexadecimal value: {x}")
+                    
+                    resolution_ADC = 4096
+                    system_voltage = 2.5
+                    analog_voltage_measured = [(x * system_voltage) / resolution_ADC for x in dec_data]
+                    
+                    row_to_append = [date, time] + analog_voltage_measured
+                    rows_to_append.append(row_to_append)
+            
+            columns = [
+                'Date', 'Time', 'Dark-1', 'Dark-2',
+                'A-780-3', 'A-780-5', 'A-810-3', 'A-810-5',
+                'A-830-3', 'A-830-5', 'A-840-3', 'A-840-5',
+                'A-850-3', 'A-850-5', 'A-890-3', 'A-890-5',
+                'B-780-5', 'B-780-3', 'B-810-5', 'B-810-3',
+                'B-830-5', 'B-830-3', 'B-840-5', 'B-840-3',
+                'B-850-5', 'B-850-3', 'B-890-5', 'B-890-3'
+            ]
+            device_data = pd.DataFrame(rows_to_append, columns=columns)
+            print("Data extraction completed.")
+            print('device_data', device_data.shape)
+            return device_data
+        
+    def group(self, device_data):
+        group_mapping = {
+            'GroupA_Detector1': ['A-780-3', 'A-810-3', 'A-830-3', 'A-840-3', 'A-850-3', 'A-890-3', 'Dark-1'],
+            'GroupA_Detector2': ['A-780-5', 'A-810-5', 'A-830-5', 'A-840-5', 'A-850-5', 'A-890-5', 'Dark-2'],
+            'GroupB_Detector2': ['B-780-3', 'B-810-3', 'B-830-3', 'B-840-3', 'B-850-3', 'B-890-3', 'Dark-2'],
+            'GroupB_Detector1': ['B-780-5', 'B-810-5', 'B-830-5', 'B-840-5', 'B-850-5', 'B-890-5', 'Dark-1']
+        }
+
+        # Add 'Date' and 'Time' columns to each group
+        for key in group_mapping:
+            group_mapping[key] = ['Date', 'Time'] + group_mapping[key]
+
+        GroupA_Detector1 = device_data[group_mapping['GroupA_Detector1']]
+        GroupA_Detector2 = device_data[group_mapping['GroupA_Detector2']]
+        GroupB_Detector2 = device_data[group_mapping['GroupB_Detector2']]
+        GroupB_Detector1 = device_data[group_mapping['GroupB_Detector1']]
+
+        return GroupA_Detector1, GroupA_Detector2, GroupB_Detector2, GroupB_Detector1
+    
+    def subtract_noise(self, *groups):
+        print("Subtracting noise from respective columns...")
+        updated_groups = []
+        for group in groups:
+            group = group.copy()  # Avoid SettingWithCopyWarning
+            if 'Dark-1' in group.columns:
+                noise = group['Dark-1']
+                for col in ['A-780-3', 'A-810-3', 'A-830-3', 'A-840-3', 'A-850-3', 'A-890-3',
+                            'B-780-5', 'B-810-5', 'B-830-5', 'B-840-5', 'B-850-5', 'B-890-5']:
+                    if col in group.columns:
+                        group.loc[:, col] = group[col] - noise
+            if 'Dark-2' in group.columns:
+                noise = group['Dark-2']
+                for col in ['A-780-5', 'A-810-5', 'A-830-5', 'A-840-5', 'A-850-5', 'A-890-5',
+                            'B-780-3', 'B-810-3', 'B-830-3', 'B-840-3', 'B-850-3', 'B-890-3']:
+                    if col in group.columns:
+                        group.loc[:, col] = group[col] - noise
+            updated_groups.append(group)
+        print("Noise subtraction completed.")
+        return updated_groups
+    
+    def apply_motion_correction(self, group):
+        print("Applying motion correction...")
+        corrected_group = group.copy()
+        for column in corrected_group.columns[2:]:  # Skip 'Date' and 'Time'
+            if np.issubdtype(corrected_group[column].dtype, np.number):
+                corrected_group[column] = self.motion_corrector.apply(corrected_group[column])
+        print("Motion correction completed.")
+        return corrected_group
+
+    def average_by_minute(self, group):
+        """Average the data by minute."""
+        group = group.copy()
+        
+        # Convert 'Time' column to datetime and extract minute
+        group['Time'] = pd.to_datetime(group['Time'], format='%H:%M:%S')
+        group['Minute'] = group['Time'].dt.strftime('%H:%M')
+        
+        # Exclude non-numeric columns from the averaging step
+        numeric_columns = group.select_dtypes(include=[np.number]).columns
+        
+        # Group by the 'Minute' column and calculate the mean for each minute
+        averaged_group = group.groupby('Minute')[numeric_columns].mean().reset_index()
+        
+        return averaged_group
+
+    def plot_data(self, original_group, averaged_group, group_name):
+        """Plot original and averaged data."""
+        fig, axs = plt.subplots(2, 1, figsize=(10, 8))
+
+        # Plot the original data (after noise subtraction but before averaging)
+        axs[0].plot(original_group['Time'], original_group.iloc[:, 2:], label=original_group.columns[2:])
+        axs[0].set_title(f'Original Data (After Noise Subtraction) - {group_name}')
+        axs[0].set_xlabel('Time')
+        axs[0].set_ylabel('Voltage (V)')
+        axs[0].legend(loc='upper right')
+
+        # Plot the averaged data
+        axs[1].plot(averaged_group['Minute'], averaged_group.iloc[:, 1:], label=averaged_group.columns[1:])
+        axs[1].set_title(f'Averaged Data (Per Minute) - {group_name}')
+        axs[1].set_xlabel('Minute')
+        axs[1].set_ylabel('Voltage (V)')
+        axs[1].legend(loc='upper right')
+
+        plt.tight_layout()
+        plt.show()
+
+# Example usage:
+if __name__ == "__main__":
+    file_path = '/home/darshana/Downloads/1010016_27+0_20240628 (1).log'
+    data_processor = digi_analog_conv(file_path)
+    
+    # Step 1: Process the data to get a DataFrame
+    device_data = data_processor.formula()
+    
+    # Step 2: Group the data
+    GroupA_Detector1, GroupA_Detector2, GroupB_Detector2, GroupB_Detector1 = data_processor.group(device_data)
+    
+    # Step 3: Apply motion correction to each group
+    GroupA_Detector1 = data_processor.apply_motion_correction(GroupA_Detector1)
+    GroupA_Detector2 = data_processor.apply_motion_correction(GroupA_Detector2)
+    GroupB_Detector2 = data_processor.apply_motion_correction(GroupB_Detector2)
+    GroupB_Detector1 = data_processor.apply_motion_correction(GroupB_Detector1)
+    
+    # Step 4: Subtract noise from the groups
+    GroupA_Detector1, GroupA_Detector2, GroupB_Detector2, GroupB_Detector1 = data_processor.subtract_noise(
+        GroupA_Detector1, GroupA_Detector2, GroupB_Detector2, GroupB_Detector1
+    )
+    
+    # Step 5: Average data by minute for each group
+    averaged_GroupA_Detector1 = data_processor.average_by_minute(GroupA_Detector1)
+    averaged_GroupA_Detector2 = data_processor.average_by_minute(GroupA_Detector2)
+    averaged_GroupB_Detector2 = data_processor.average_by_minute(GroupB_Detector2)
+    averaged_GroupB_Detector1 = data_processor.average_by_minute(GroupB_Detector1)
+    
+    # Step 6: Plot the data for each group
+    data_processor.plot_data(GroupA_Detector1, averaged_GroupA_Detector1, 'GroupA_Detector1')
+    data_processor.plot_data(GroupA_Detector2, averaged_GroupA_Detector2, 'GroupA_Detector2')
+    data_processor.plot_data(GroupB_Detector1, averaged_GroupB_Detector1, 'GroupB_Detector1')
+    data_processor.plot_data(GroupB_Detector2, averaged_GroupB_Detector2, 'GroupB_Detector2')
